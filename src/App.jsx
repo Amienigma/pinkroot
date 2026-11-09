@@ -7,6 +7,7 @@ import {
   ChevronRight, Power, CornerDownLeft, Sparkles, Filter, Clock,
   Maximize2, Minimize2, CheckCircle2, XCircle, ShieldAlert, Wifi
 } from 'lucide-react';
+import LiveTerminal from './LiveTerminal.jsx';
 
 // --- INITIAL STATE DATA ---
 const INITIAL_KEYS = [
@@ -38,12 +39,40 @@ const INITIAL_AUDIT_LOGS = [
   { id: 'log_105', timestamp: '2025-02-15 12:30:00', user: 'system_daemon', event: 'VAULT_ENCRYPTION_CHECK', details: 'AES-256 GCM key store integrity verified. 0 leaks found.', ip: '127.0.0.1', severity: 'info' }
 ];
 
+function formatUptime(sec = 0) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m ${s % 60}s`;
+}
+
+function formatBytes(n = 0) {
+  return `${(n / 1024 ** 3).toFixed(1)} GB`;
+}
+
 export default function App() {
   // Navigation State
   const [activeTab, setActiveTab] = useState('dashboard');
   const [contentMode, setContentMode] = useState('STANDARD'); // 'STANDARD' | 'ADVANCED'
   const [scanlines, setScanlines] = useState(false);
   const [toastMsg, setToastMsg] = useState(null);
+  const [serverUrl, setServerUrl] = useState(() => {
+    try { return localStorage.getItem('pinkroot_server') || window.location.origin; }
+    catch { return ''; }
+  });
+  const [authToken, setAuthToken] = useState(() => {
+    try { return localStorage.getItem('pinkroot_jwt') || ''; }
+    catch { return ''; }
+  });
+  const [serverPassword, setServerPassword] = useState('');
+  const [connectOpen, setConnectOpen] = useState(false);
+  const [connectError, setConnectError] = useState('');
+  const [connecting, setConnecting] = useState(false);
+  const [sysInfo, setSysInfo] = useState(null);
+  const connected = Boolean(authToken);
 
   // Vault & Keys State
   const [keys, setKeys] = useState(INITIAL_KEYS);
@@ -106,8 +135,10 @@ export default function App() {
   // Realtime Telemetry Simulation
   useEffect(() => {
     const interval = setInterval(() => {
-      setCpuUsage(prev => Math.min(99, Math.max(12, Math.floor(prev + (Math.random() * 12 - 6)))));
-      setRamUsage(prev => +(Math.min(15.8, Math.max(2.1, prev + (Math.random() * 0.4 - 0.2)))).toFixed(1));
+      if (!connected) {
+        setCpuUsage(prev => Math.min(99, Math.max(12, Math.floor(prev + (Math.random() * 12 - 6)))));
+        setRamUsage(prev => +(Math.min(15.8, Math.max(2.1, prev + (Math.random() * 0.4 - 0.2)))).toFixed(1));
+      }
       setNetSpeed({
         in: Math.floor(350 + Math.random() * 300),
         out: Math.floor(700 + Math.random() * 400)
@@ -124,7 +155,79 @@ export default function App() {
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, []);
+  }, [connected]);
+
+  useEffect(() => {
+    if (!authToken) {
+      setSysInfo(null);
+      return;
+    }
+    const url = (serverUrl || window.location.origin).replace(/\/$/, '');
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const res = await fetch(`${url}/api/system`, {
+          headers: { Authorization: `Bearer ${authToken}` }
+        });
+        if (res.status === 401) {
+          localStorage.removeItem('pinkroot_jwt');
+          if (!cancelled) {
+            setAuthToken('');
+            setSysInfo(null);
+          }
+          return;
+        }
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setSysInfo(data);
+        const cpuCount = data.cpus?.count || 1;
+        setCpuUsage(Math.min(99, Math.max(0, Math.round(((data.loadavg?.[0] || 0) / cpuCount) * 100))));
+        setRamUsage(+((data.mem.used / 1024 ** 3).toFixed(1)));
+      } catch {
+        // server unreachable; keep last known stats
+      }
+    };
+    pull();
+    const id = setInterval(pull, 3000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [authToken, serverUrl]);
+
+  const handleConnect = async (e) => {
+    e.preventDefault();
+    setConnecting(true);
+    setConnectError('');
+    const url = (serverUrl || window.location.origin).replace(/\/$/, '');
+    try {
+      const res = await fetch(`${url}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: serverPassword })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Login failed (${res.status})`);
+      if (!data.token) throw new Error('Server did not return a token');
+      localStorage.setItem('pinkroot_jwt', data.token);
+      localStorage.setItem('pinkroot_server', url);
+      setAuthToken(data.token);
+      setServerUrl(url);
+      setServerPassword('');
+      setConnectOpen(false);
+      showToast('Connected to server');
+    } catch (err) {
+      setConnectError(err.message || 'Could not reach server');
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const handleDisconnect = () => {
+    localStorage.removeItem('pinkroot_jwt');
+    setAuthToken('');
+    setSysInfo(null);
+    setServerPassword('');
+    showToast('Disconnected — demo mode');
+  };
 
   // Auto Scroll Terminal
   useEffect(() => {
@@ -372,7 +475,67 @@ MAX_CONCURRENT_WORKERS=64`;
           {/* Cluster Status Badge */}
           <div className="hidden lg:flex items-center gap-2 bg-emerald-950/40 border border-emerald-500/30 px-3 py-1 rounded-xl">
             <div className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></div>
-            <span className="text-xs font-mono text-emerald-300 font-semibold">CLUSTER: ONLINE</span>
+            <span className="text-xs font-mono text-emerald-300 font-semibold">
+              {connected ? `LIVE: ${sysInfo?.hostname || 'CONNECTED'}` : 'CLUSTER: ONLINE'}
+            </span>
+          </div>
+
+          <div className="relative">
+            <button
+              onClick={() => { setConnectOpen(v => !v); setConnectError(''); }}
+              className={`p-2 rounded-xl border transition-all ${connected ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200' : 'border-pink-500/20 text-pink-400/70 hover:text-pink-200'}`}
+              title="Connect to server"
+            >
+              <Wifi className="w-4 h-4" />
+            </button>
+            {connectOpen && (
+              <form
+                onSubmit={handleConnect}
+                className="absolute right-0 top-12 w-80 bg-[#1a0c2e] border border-pink-500/40 rounded-2xl p-4 shadow-[0_0_30px_rgba(236,72,153,0.3)] z-50 space-y-3"
+              >
+                <div className="text-xs font-bold text-white tracking-wide">Connect to server</div>
+                <div>
+                  <label className="block text-[10px] text-pink-300 font-semibold mb-1 uppercase tracking-wider">Server URL</label>
+                  <input
+                    type="url"
+                    value={serverUrl}
+                    onChange={e => setServerUrl(e.target.value)}
+                    placeholder="http://localhost:8108"
+                    className="w-full bg-[#10061e] border border-pink-500/30 rounded-xl p-2.5 text-pink-100 outline-none focus:border-pink-500 text-xs font-mono"
+                  />
+                </div>
+                {!connected && (
+                  <div>
+                    <label className="block text-[10px] text-pink-300 font-semibold mb-1 uppercase tracking-wider">Password</label>
+                    <input
+                      type="password"
+                      value={serverPassword}
+                      onChange={e => setServerPassword(e.target.value)}
+                      autoComplete="current-password"
+                      className="w-full bg-[#10061e] border border-pink-500/30 rounded-xl p-2.5 text-pink-100 outline-none focus:border-pink-500 text-xs font-mono"
+                    />
+                  </div>
+                )}
+                {connectError && <div className="text-[11px] text-rose-300">{connectError}</div>}
+                {connected ? (
+                  <button
+                    type="button"
+                    onClick={handleDisconnect}
+                    className="w-full py-2 bg-[#251036] hover:bg-[#32164a] border border-pink-500/40 text-pink-200 rounded-xl text-xs font-bold"
+                  >
+                    Disconnect
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    disabled={connecting}
+                    className="w-full py-2 bg-pink-500 hover:bg-pink-600 text-white rounded-xl text-xs font-bold shadow-[0_0_15px_rgba(236,72,153,0.5)] disabled:opacity-60"
+                  >
+                    {connecting ? 'Connecting…' : 'Connect'}
+                  </button>
+                )}
+              </form>
+            )}
           </div>
         </div>
       </header>
@@ -431,12 +594,12 @@ MAX_CONCURRENT_WORKERS=64`;
           <div className="bg-[#1b0d2b] border border-pink-500/20 rounded-2xl p-3.5 space-y-2 mt-4 shadow-inner">
             <div className="flex items-center justify-between text-[11px] text-pink-300/80 font-mono">
               <span>RAM ALLOC</span>
-              <span className="text-pink-400 font-bold">{ramUsage} GB / 16.0 GB</span>
+              <span className="text-pink-400 font-bold">{ramUsage} GB / {sysInfo ? formatBytes(sysInfo.mem.total) : '16.0 GB'}</span>
             </div>
             <div className="w-full bg-pink-950/80 rounded-full h-2 overflow-hidden border border-pink-500/20">
               <div 
                 className="bg-gradient-to-r from-pink-500 to-fuchsia-500 h-full transition-all duration-500"
-                style={{ width: `${(ramUsage / 16) * 100}%` }}
+                style={{ width: `${(ramUsage / (sysInfo ? sysInfo.mem.total / 1024 ** 3 : 16)) * 100}%` }}
               ></div>
             </div>
             <div className="flex justify-between items-center text-[10px] text-pink-400/60 pt-1">
@@ -473,6 +636,42 @@ MAX_CONCURRENT_WORKERS=64`;
                   </div>
                 </div>
               </div>
+
+              {sysInfo && (
+                <div className="bg-[#180c29]/80 border border-pink-500/20 rounded-2xl p-5 shadow-lg">
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Server className="w-4 h-4 text-pink-400" />
+                      LIVE HOST
+                    </h3>
+                    <span className="text-[10px] font-mono bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-md border border-emerald-500/30">
+                      {sysInfo.hostname}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-xs font-mono">
+                    <div>
+                      <div className="text-pink-400/70 uppercase tracking-wider text-[10px]">Platform</div>
+                      <div className="text-white font-semibold">{sysInfo.platform} / {sysInfo.arch}</div>
+                    </div>
+                    <div>
+                      <div className="text-pink-400/70 uppercase tracking-wider text-[10px]">Uptime</div>
+                      <div className="text-white font-semibold">{formatUptime(sysInfo.uptime)}</div>
+                    </div>
+                    <div>
+                      <div className="text-pink-400/70 uppercase tracking-wider text-[10px]">Load avg</div>
+                      <div className="text-white font-semibold">{(sysInfo.loadavg || []).map(n => Number(n).toFixed(2)).join('  ')}</div>
+                    </div>
+                    <div>
+                      <div className="text-pink-400/70 uppercase tracking-wider text-[10px]">Memory</div>
+                      <div className="text-white font-semibold">{formatBytes(sysInfo.mem.used)} / {formatBytes(sysInfo.mem.total)}</div>
+                    </div>
+                    <div className="md:col-span-2">
+                      <div className="text-pink-400/70 uppercase tracking-wider text-[10px]">CPUs</div>
+                      <div className="text-white font-semibold">{sysInfo.cpus.count} × {sysInfo.cpus.model}</div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Metric Stat Cards */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -598,7 +797,9 @@ MAX_CONCURRENT_WORKERS=64`;
                     <Terminal className="w-5 h-5 text-pink-400" />
                     ISOLATED SERVER TERMINAL
                   </h2>
-                  <p className="text-xs text-pink-300/70">Interactive command execution in isolated container sandbox.</p>
+                  <p className="text-xs text-pink-300/70">
+                    {connected ? 'Live bash session on the connected Linux host.' : 'Interactive command execution in isolated container sandbox.'}
+                  </p>
                 </div>
 
                 {/* Terminal Tab Switcher */}
@@ -638,16 +839,24 @@ MAX_CONCURRENT_WORKERS=64`;
                     <div className="w-3 h-3 rounded-full bg-rose-500/80"></div>
                     <div className="w-3 h-3 rounded-full bg-amber-500/80"></div>
                     <div className="w-3 h-3 rounded-full bg-emerald-500/80"></div>
-                    <span className="text-xs text-pink-300/70 font-semibold ml-2">bash - pinkroot-sandbox-v4</span>
+                    <span className="text-xs text-pink-300/70 font-semibold ml-2">
+                      {connected ? `bash — ${sysInfo?.hostname || 'live'}` : 'bash - pinkroot-sandbox-v4'}
+                    </span>
                   </div>
-                  <button 
-                    onClick={() => setTermHistory(prev => prev.filter(h => h.tab !== activeTermTab))}
-                    className="text-[11px] text-pink-400/60 hover:text-pink-300"
-                  >
-                    Clear Screen
-                  </button>
+                  {!connected && (
+                    <button 
+                      onClick={() => setTermHistory(prev => prev.filter(h => h.tab !== activeTermTab))}
+                      className="text-[11px] text-pink-400/60 hover:text-pink-300"
+                    >
+                      Clear Screen
+                    </button>
+                  )}
                 </div>
 
+                {connected ? (
+                  <LiveTerminal serverUrl={serverUrl || window.location.origin} token={authToken} />
+                ) : (
+                <>
                 {/* Output Screen */}
                 <div className="flex-1 p-4 overflow-y-auto space-y-2 text-xs">
                   {termHistory.filter(h => h.tab === activeTermTab).map((item, idx) => (
@@ -683,6 +892,8 @@ MAX_CONCURRENT_WORKERS=64`;
                     EXEC
                   </button>
                 </form>
+                </>
+                )}
               </div>
             </div>
           )}
@@ -1080,7 +1291,7 @@ MAX_CONCURRENT_WORKERS=64`;
                     <span className="font-mono text-pink-400">{ramUsage} GB</span>
                   </div>
                   <div className="w-full bg-pink-950 rounded-full h-3 overflow-hidden border border-pink-500/20">
-                    <div className="bg-gradient-to-r from-fuchsia-500 to-purple-500 h-full transition-all duration-500" style={{ width: `${(ramUsage / 16) * 100}%` }}></div>
+                    <div className="bg-gradient-to-r from-fuchsia-500 to-purple-500 h-full transition-all duration-500" style={{ width: `${(ramUsage / (sysInfo ? sysInfo.mem.total / 1024 ** 3 : 16)) * 100}%` }}></div>
                   </div>
                 </div>
 
